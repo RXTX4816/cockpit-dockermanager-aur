@@ -1,0 +1,122 @@
+name: Check upstream release
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  UPSTREAM: chrisjbawden/cockpit-dockermanager
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine current and latest version
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          current=$(grep -m1 '^pkgver=' PKGBUILD | cut -d= -f2)
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+
+          # Real releases are tagged vX.Y.Z...; "latest" is a rolling marker
+          # and anything with "-canary"/prerelease=true is not a stable release.
+          latest_tag=$(gh api "repos/$UPSTREAM/releases?per_page=20" \
+            --jq '[.[] | select(.prerelease == false) | select(.tag_name | test("^v[0-9]+(\\.[0-9]+)*$"))][0].tag_name')
+
+          if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+            echo "Could not determine a stable release tag" >&2
+            exit 1
+          fi
+
+          latest="${latest_tag#v}"
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+          if [[ "$current" == "$latest" ]]; then
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch release notes and history
+        if: steps.versions.outputs.has_update == 'true'
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.versions.outputs.latest_tag }}"
+
+          gh api "repos/$UPSTREAM/releases/tags/$tag" --jq '.body // "_(no release notes provided)_"' > /tmp/notes.md
+
+          {
+            echo "| Tag | Published |"
+            echo "|---|---|"
+            gh api "repos/$UPSTREAM/releases?per_page=20" \
+              --jq '[.[] | select(.prerelease == false) | select(.tag_name | test("^v[0-9]+(\\.[0-9]+)*$"))][:5] | .[] | "| \(.tag_name) | \(.published_at) |"'
+          } > /tmp/history.md
+
+      - name: Write job summary
+        if: steps.versions.outputs.has_update == 'true'
+        run: |
+          {
+            echo "## New upstream release: ${{ steps.versions.outputs.latest_tag }}"
+            echo
+            echo "Current AUR package version: \`${{ steps.versions.outputs.current }}\`"
+            echo "New version: \`${{ steps.versions.outputs.latest }}\`"
+            echo
+            echo "[Compare changes](https://github.com/$UPSTREAM/compare/v${{ steps.versions.outputs.current }}...${{ steps.versions.outputs.latest_tag }})"
+            echo
+            echo "### Release notes"
+            cat /tmp/notes.md
+            echo
+            echo "### Recent release history"
+            cat /tmp/history.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update tracking issue
+        if: steps.versions.outputs.has_update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.versions.outputs.latest_tag }}"
+          label="release-update"
+
+          gh label create "$label" --color "0E8A16" --description "Pending AUR package update" 2>/dev/null || true
+
+          existing=$(gh issue list --label "$label" --state open --search "\"$tag\" in:title" --json number --jq '.[0].number // empty')
+          if [[ -n "$existing" ]]; then
+            echo "Issue #$existing already tracks $tag, skipping."
+            exit 0
+          fi
+
+          {
+            echo "Upstream released **$tag** (current AUR version: \`${{ steps.versions.outputs.current }}\`)."
+            echo
+            echo "[Compare changes](https://github.com/$UPSTREAM/compare/v${{ steps.versions.outputs.current }}...$tag)"
+            echo
+            echo "### Release notes"
+            cat /tmp/notes.md
+            echo
+            echo "### Recent release history"
+            cat /tmp/history.md
+            echo
+            echo "---"
+            echo "To publish: open **Actions → Publish to AUR → Run workflow**, enter \`$tag\` as the version, then approve the \`aur-publish\` environment review when prompted."
+          } > /tmp/issue-body.md
+
+          gh issue create \
+            --title "Release $tag available for AUR" \
+            --label "$label" \
+            --body-file /tmp/issue-body.md

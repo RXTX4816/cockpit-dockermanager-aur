@@ -1,0 +1,128 @@
+name: Publish to AUR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to publish, e.g. v1.0.8.2'
+        required: true
+      commit_message:
+        description: 'Commit message for the AUR push'
+        required: false
+        default: 'Update package'
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: chrisjbawden/cockpit-dockermanager
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: aur-publish
+    permissions:
+      contents: write
+      issues: write
+    container:
+      image: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version against upstream releases
+        id: validate
+        run: |
+          set -euo pipefail
+          pacman -Sy --noconfirm --needed curl jq >/dev/null
+          tag="${{ inputs.version }}"
+          ok=$(curl -fsSL "https://api.github.com/repos/$UPSTREAM/releases/tags/$tag" | jq -r '.tag_name // empty')
+          if [[ "$ok" != "$tag" ]]; then
+            echo "::error::$tag is not a published release on $UPSTREAM" >&2
+            exit 1
+          fi
+          echo "pkgver=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Update PKGBUILD version
+        run: |
+          set -euo pipefail
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.validate.outputs.pkgver }}/" PKGBUILD
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed base-devel git openssh
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          sudo -u builder bash -c 'cd "$GITHUB_WORKSPACE" && makepkg -s --noconfirm 2>&1 | tee build.log'
+          if grep -q '==> ERROR:' build.log; then
+            echo "::error::makepkg reported an error, see build.log" >&2
+            exit 1
+          fi
+          sudo -u builder bash -c 'cd "$GITHUB_WORKSPACE" && makepkg --printsrcinfo > .SRCINFO'
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 600 ~/.ssh/known_hosts
+
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes"
+          git config --global user.name "RXTX4816"
+          git config --global user.email "RXTX4816@proton.me"
+
+          rm -rf /tmp/aur-repo
+          git clone ssh://aur@aur.archlinux.org/cockpit-dockermanager.git /tmp/aur-repo
+          cp PKGBUILD .SRCINFO /tmp/aur-repo/
+          cd /tmp/aur-repo
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes to push to AUR."
+            exit 0
+          fi
+          git add PKGBUILD .SRCINFO
+          git commit -m "${{ inputs.commit_message }} (${{ inputs.version }})"
+          git push origin master
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/aur
+
+      - name: Sync PKGBUILD back to repo
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "Nothing to sync."
+            exit 0
+          fi
+          git commit -m "chore: sync PKGBUILD after AUR push (${{ inputs.version }})"
+          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:main
+
+      - name: Close tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.version }}"
+          api="https://api.github.com/repos/${{ github.repository }}"
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+
+          number=$(curl -fsSL "${auth[@]}" "$api/issues?labels=release-update&state=open" \
+            | jq -r --arg tag "$tag" '[.[] | select(.title | contains($tag))][0].number // empty')
+
+          if [[ -n "$number" ]]; then
+            run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            curl -fsSL "${auth[@]}" -X POST "$api/issues/$number/comments" \
+              -d "{\"body\":\"Published to AUR as part of this workflow run: $run_url\"}" >/dev/null
+            curl -fsSL "${auth[@]}" -X PATCH "$api/issues/$number" \
+              -d '{"state":"closed"}' >/dev/null
+          fi
