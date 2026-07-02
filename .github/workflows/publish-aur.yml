@@ -27,6 +27,9 @@ jobs:
     container:
       image: archlinux:base-devel
     steps:
+      - name: Install git
+        run: pacman -Sy --noconfirm --needed git >/dev/null
+
       - uses: actions/checkout@v4
 
       - name: Validate version against upstream releases
