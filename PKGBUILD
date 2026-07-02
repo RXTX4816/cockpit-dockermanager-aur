@@ -1,6 +1,6 @@
 # Maintainer: RXTX4816 <RXTX4816@proton.me>
 pkgname=cockpit-dockermanager
-pkgver=1.0.7.0
+pkgver=1.0.8.2
 pkgrel=1
 pkgdesc="A Cockpit plugin for managing Docker containers"
 arch=('any')
