@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   issues: write
+  actions: write
 
 env:
   UPSTREAM: chrisjbawden/cockpit-dockermanager
@@ -113,10 +114,12 @@ jobs:
             cat /tmp/history.md
             echo
             echo "---"
-            echo "To publish: open **Actions → Publish to AUR → Run workflow**, enter \`$tag\` as the version, then approve the \`aur-publish\` environment review when prompted."
+            echo "A publish workflow run has been triggered automatically. Go to **Actions → Publish to AUR** and approve the \`aur-publish\` environment review to release."
           } > /tmp/issue-body.md
 
           gh issue create \
             --title "Release $tag available for AUR" \
             --label "$label" \
             --body-file /tmp/issue-body.md
+
+          gh workflow run publish-aur.yml --ref main --field version="$tag"
